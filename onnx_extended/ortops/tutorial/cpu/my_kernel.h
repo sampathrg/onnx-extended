@@ -1,12 +1,15 @@
 #pragma once
 
 #include "common/common_kernels.h"
+#include "tb_runner.h"
 
 namespace ortops {
 
 struct MyCustomKernel {
   MyCustomKernel(const OrtApi &api, const OrtKernelInfo *info);
   void Compute(OrtKernelContext* context);
+private:
+  TreebeardSORunner soRunner;
 };
 
 struct MyCustomOp : Ort::CustomOpBase<MyCustomOp, MyCustomKernel> {
