@@ -45,6 +45,7 @@ from pandas import DataFrame
 from sklearn.datasets import make_regression
 from sklearn.ensemble import RandomForestRegressor
 from skl2onnx import to_onnx
+import onnxruntime as ort
 from onnxruntime import InferenceSession, SessionOptions
 from onnx_extended.ortops.optim.cpu import get_ort_ext_libs
 from onnx_extended.ortops.optim.optimize import (
@@ -53,11 +54,19 @@ from onnx_extended.ortops.optim.optimize import (
 )
 from onnx_extended.tools.onnx_nodes import multiply_tree
 from onnx_extended.validation.cpu._validation import dense_to_sparse_struct
+import sys
+import pandas
+import math
 
 # from onnx_extended.plotting.benchmark import hhistograms
 from onnx_extended.args import get_parsed_args
 from onnx_extended.ext_test_case import unit_test_going
 from onnx_extended.ext_test_case import measure_time
+
+tb_dir = os.environ.get("TB_DIR", "SKIP")
+if tb_dir != "SKIP":
+    sys.path.append(tb_dir)
+    import treebeard
 
 logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
 
@@ -83,21 +92,45 @@ script_args = get_parsed_args(
     use_node3=(0, "values to try for use_node3"),
     expose="",
     n_jobs=("-1", "number of jobs to train the RandomForestRegressor"),
+    serial=(0, "Set 1 to run ort and tb serially"),
+    onnx_model=("", "Path to the onnx model to benchmark"),
 )
+
+def construct_inputs(csvPath : str, batch_size) -> numpy.ndarray:
+  data_df = pandas.read_csv(csvPath, header=None)
+  full_test_array = numpy.array(data_df, order='C')
+  num_repeats = 1
+  if (full_test_array.shape[0] < batch_size):
+    num_repeats = math.ceil(batch_size/full_test_array.shape[0])
+  full_test_array = numpy.tile(full_test_array, (num_repeats, 1))
+  inputs = numpy.array(full_test_array[0:batch_size, :-1], numpy.float32, order='C')
+
+  return inputs
+
+def compute_model_path_and_construct_inputs(model_name, batch_size):
+    repo_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    model_path = os.path.join(repo_dir, "onnx_bms", model_name + ".onnx")
+    csv_path = os.path.join(repo_dir, "onnx_bms", model_name + ".json.test.sampled.csv")
+
+    yb = numpy.zeros((batch_size, 1), dtype=numpy.float32)
+    inputs = construct_inputs(csv_path, batch_size)
+    print("Input shape", inputs.shape)
+    return model_path, inputs, yb
 
 
 ################################
 # Training a model
 # ++++++++++++++++
 
-
 def train_model(
     batch_size: int, n_features: int, n_trees: int, max_depth: int, sparsity: float
 ) -> Tuple[str, numpy.ndarray, numpy.ndarray]:
+    
     filename = (
         f"plot_op_tree_ensemble_sparse-f{n_features}-{n_trees}-"
         f"d{max_depth}-s{sparsity}.onnx"
     )
+
     if not os.path.exists(filename):
         X, y = make_regression(
             batch_size + max(batch_size, 2 ** (max_depth + 1)),
@@ -156,7 +189,14 @@ print(f"max_depth={max_depth}")
 print(f"sparsity={sparsity}")
 print(f"warmup={warmup}")
 
-filename, Xb, yb = train_model(batch_size, n_features, n_trees, max_depth, sparsity)
+filename = None
+Xb = None
+yb = None
+
+if script_args.onnx_model != "":
+    filename, Xb, yb = compute_model_path_and_construct_inputs(script_args.onnx_model, batch_size)
+else:
+    filename, Xb, yb = train_model(batch_size, n_features, n_trees, max_depth, sparsity)
 
 print(f"Xb.shape={Xb.shape}")
 print(f"yb.shape={yb.shape}")
@@ -165,7 +205,50 @@ print(f"measured sparsity={measure_sparsity(Xb)}")
 #############################################
 # Implementations
 # +++++++++++++++
+tree_tile_size = 8
+pipeline_width = 8
+def get_compiler_options(batch_size):
+    compiler_options = treebeard.CompilerOptions(batch_size, tree_tile_size)
 
+    if script_args.serial == 0:
+        compiler_options.SetNumberOfCores(multiprocessing.cpu_count())
+
+    compiler_options.SetMakeAllLeavesSameDepth(1)
+    compiler_options.SetReorderTreesByDepth(True)
+    compiler_options.SetPipelineWidth(pipeline_width)
+    return compiler_options
+
+class FakeONNXSession:
+    def __init__(self, onx, inferenceRunner):
+        self.inferenceRunner = inferenceRunner
+        self.batchSize = inferenceRunner.batchSize
+        self.inputName = onx.graph.node[0].input[0]
+
+    def run(self, dummy, inputs):
+        inp = inputs[self.inputName]
+        res = self.inferenceRunner.RunInference(inp, numpy.float32)
+        return [res.reshape(self.batchSize, 1)]
+    
+def jit_tree(
+        onx: ModelProto,
+        batch_size: int,
+        n_features: int,
+):
+    
+
+    compiler_options = get_compiler_options(batch_size)
+    compiler_options.SetNumberOfFeatures(n_features)
+    treebeard.SetEnableSparseRepresentation(1)
+
+    if not os.path.exists(filename):
+        with open(filename, "wb") as f:
+            f.write(onx.SerializeToString())
+
+    onnx_model_path = os.path.abspath(filename)
+    inferenceRunner = treebeard.TreebeardInferenceRunner.FromONNXModelFile(onnx_model_path, compiler_options)
+    #inferenceRunner = treebeard.TreebeardInferenceRunner.FromModelFile("/home/srajendra/repos/llvm-project/mlir/examples/treebeard/xgb_models/abalone_xgb_model_save.json", "", compiler_options)
+    return inferenceRunner
+    
 
 def compile_tree(
     llc_exe: str,
@@ -202,21 +285,21 @@ def compile_tree(
     """
     if verbose:
         print("[compile_tree] import treebeard")
-    import treebeard
-
+    
+    tb_dir = os.environ.get("TB_DIR", "SKIP")
+    if tb_dir == "SKIP":
+        warnings.warn("Unable to find environment variable 'TB_DIR'.")
+        return None
+    
     if verbose:
         print(
             f"[compile_tree] treebeard set options, "
             f"batch_size={batch_size}, tree_tile_size={tree_tile_size}"
         )
-    compiler_options = treebeard.CompilerOptions(batch_size, tree_tile_size)
-
-    compiler_options.SetNumberOfCores(n_cores or multiprocessing.cpu_count())
-    compiler_options.SetMakeAllLeavesSameDepth(pipeline_width)
-    compiler_options.SetReorderTreesByDepth(reorder_tree_by_depth)
+    compiler_options = get_compiler_options(batch_size)
     compiler_options.SetNumberOfFeatures(n_features)
+
     assert 8 < batch_size
-    compiler_options.SetPipelineWidth(8)
 
     if verbose:
         print(f"[compile_tree] write filename={filename!r}")
@@ -262,7 +345,7 @@ def compile_tree(
         [
             llc_exe,
             llvm_file_path,
-            "-O3",
+            "-O0",
             "-march=x86-64",
             "-mcpu=native",
             "--relocation-model=pic",
@@ -386,14 +469,24 @@ def enumerate_implementations(
     :return: see annotation
     """
     providers = ["CPUExecutionProvider"]
+    opts = SessionOptions()
+
+    if script_args.serial != 0:
+        opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = 1
+        opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+    # Check environmental variables just in case
+    #os.environ["OMP_NUM_THREADS"] = "1"
+    #os.environ["OMP_WAIT_POLICY"] = "PASSIVE"
     yield (
         "ort",
-        InferenceSession(onx.SerializeToString(), providers=providers),
+        InferenceSession(onx.SerializeToString(), sess_options=opts, providers=providers),
         X,
     )
 
     r = get_ort_ext_libs()
-    opts = SessionOptions()
+    #opts = SessionOptions()
     if r is not None:
         opts.register_custom_ops_library(r[0])
 
@@ -426,7 +519,12 @@ def enumerate_implementations(
         verbose=verbose,
         **treebeard_settings,
     )
+
     yield ("assembly", sess, X)
+
+    sess = FakeONNXSession(onx,jit_tree(onx, batch_size=X.shape[0], n_features=X.shape[1]))
+
+    yield ("jit", sess, X)
 
 
 parallel_settings = dict(
@@ -455,7 +553,7 @@ for name, sess, tensor in enumerate_implementations(
         continue
     sessions.append((name, sess, tensor))
     print(f"run {name!r} - shape={tensor.shape}")
-    feeds = {"X": tensor}
+    feeds = {onx.graph.node[0].input[0]: tensor}
     sess.run(None, feeds)
 print("done.")
 
@@ -471,7 +569,7 @@ baseline = None
 print("----- measure time")
 for name, sess, tensor in sessions:
     print(f"run {name!r}")
-    feeds = {"X": tensor}
+    feeds = {onx.graph.node[0].input[0]: tensor}
     output = sess.run(None, feeds)[0]
     if baseline is None:
         baseline = output
@@ -498,7 +596,7 @@ print(df)
 
 ####################################
 # Plots.
-print(df.columns)
+# print(df.columns)
 
 fig, ax = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
 df[["name", "average"]].set_index("name").plot.barh(
